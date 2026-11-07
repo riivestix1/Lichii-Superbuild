@@ -1,0 +1,96 @@
+name: Windows RDNA2 test build (upstream PR 629)
+
+on:
+  push:
+    branches:
+      - rdna2-v15-fix-pr629
+    paths:
+      - "src/**"
+      - ".github/workflows/windows-rdna2-fix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-rdna2:
+    name: Lichii v15 + PR 629 (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 110
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out v15 plus RDNA2 patch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Verify patch is included
+        run: |
+          grep -q 'IsAmdWithoutMatrixUnits' src/video_core/vulkan_common/vulkan_device.cpp
+          grep -q 'Cooperative matrices off: AMD GPU without matrix units' src/video_core/vulkan_common/vulkan_device.cpp
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      - name: Install LLVM
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Configure Windows GUI build
+        run: |
+          cmake -S . -B build/rdna2 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DENABLE_QT=ON \
+            -DYUZU_CMD=OFF \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DLICHII_BUILD_TAG=rdna2-v15-pr629 \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin" \
+            "-DCMAKE_CXX_FLAGS=-EHsc -DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
+
+      - name: Compile Windows GUI
+        run: cmake --build build/rdna2 --target yuzu --parallel 4
+
+      - name: Bundle Windows Qt dependencies
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/rdna2/bin/lichii.exe")) {
+            throw "Missing compiled lichii.exe"
+          }
+          windeployqt --release --no-translations build/rdna2/bin/lichii.exe
+          Get-ChildItem build/rdna2/bin | Select-Object Name,Length
+
+      - name: Upload RDNA2 test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lichii-v15-RDNA2-PR629-Windows-x64
+          path: build/rdna2/bin/
+          if-no-files-found: error
+          retention-days: 14
