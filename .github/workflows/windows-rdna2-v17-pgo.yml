@@ -1,0 +1,145 @@
+name: Zelda AMD RDNA2 v17 PGO test
+
+on:
+  push:
+    branches: [rdna2-v17-pgo-oot-test]
+    paths:
+      - "patches/rdna2-pr629.patch"
+      - ".github/workflows/windows-rdna2-v17-pgo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdna2-v17-pgo-oot-test
+  cancel-in-progress: false
+
+jobs:
+  windows-amd-v17-pgo:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out our versioned AMD fix and build instructions
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: builder
+          persist-credentials: false
+
+      - name: Check out exact upstream Lichii Superbuild v17 source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: callme-sy/Lichii-Superbuild
+          ref: 6056820cfc54efe60589ad4e19dbac98f0f6c0f0
+          path: upstream
+          persist-credentials: false
+
+      - name: Verify source provenance and apply tested PR 629
+        run: |
+          set -euo pipefail
+          cd upstream
+          test "$(git rev-parse HEAD)" = 6056820cfc54efe60589ad4e19dbac98f0f6c0f0
+          git apply --check ../builder/patches/rdna2-pr629.patch
+          git apply ../builder/patches/rdna2-pr629.patch
+          git diff --check
+          grep -q 'IsAmdWithoutMatrixUnits' src/video_core/vulkan_common/vulkan_device.cpp
+          test -s lichii-windows.profdata
+          echo "Verified: upstream v17 plus exactly the tested AMD RDNA2 patch."
+
+      - name: Set up MSVC SDK and headers
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      - name: Install checksum-pinned LLVM 22.1.8
+        shell: pwsh
+        run: ./upstream/tools/windows/install-llvm.ps1
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./upstream/tools/windows/install-vulkan-sdk.ps1
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: upstream/.cache/cpm
+          key: rdna2-oot-v17-windows-cpm-v1
+
+      - name: Configure Windows PGO optimized build
+        run: |
+          set -euo pipefail
+          cd upstream
+          profile="$(cygpath -m "$PWD/lichii-windows.profdata")"
+          baseflags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin -fprofile-use=$profile"
+          profilewarnings="-Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled -Wno-error=backend-plugin"
+          cmake -S . -B build/rdna2-pgo -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DENABLE_QT=ON \
+            -DYUZU_CMD=OFF \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_NVIDIA_DLSS=OFF \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DLICHII_BUILD_TAG=rdna2-v17-pgo-pr629 \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=$baseflags $profilewarnings" \
+            "-DCMAKE_CXX_FLAGS=-EHsc $baseflags $profilewarnings"
+
+      - name: Compile Windows GUI with Ocarina of Time PGO profile
+        run: |
+          cd upstream
+          cmake --build build/rdna2-pgo --target yuzu --parallel 4
+
+      - name: Bundle Windows dependencies and verification notes
+        shell: pwsh
+        run: |
+          $folder = 'upstream/build/rdna2-pgo/bin'
+          if (-not (Test-Path "$folder/lichii.exe")) {
+            throw 'Windows Lichii executable was not produced'
+          }
+          windeployqt --release --no-translations "$folder/lichii.exe"
+          @'
+          Lichii Superbuild v17 + AMD RDNA2 fix PR #629 + Zelda PGO
+          Built from pinned upstream v17 commit: 6056820cfc54efe60589ad4e19dbac98f0f6c0f0
+          Patch source: https://github.com/zortos293/Lichii/pull/629
+          Build: clang-cl 22.1.8, ThinLTO, Ocarina of Time PGO profile.
+          NVIDIA DLSS and automatic updater are disabled for this AMD test build.
+          No games, keys, firmware or save files are included.
+
+          Compare with your known-working v15 RDNA2 build, at the SAME save point.
+          Match resolution, graphics settings, game scene and time of day.
+          1) Start with normal Ocarina of Time anti-aliasing = Game.
+          2) Optionally try No sharpening, record FPS AND visual differences.
+          3) If crash or visual corruption occurs, close this test version.
+          4) Keep the original v15 binary untouched. Do not delete shader caches.
+          '@ | Set-Content -Encoding UTF8 "$folder/README-RDNA2-TEST.txt"
+          Get-FileHash -Algorithm SHA256 "$folder/lichii.exe" | Format-List
+
+      - name: Upload Windows PGO test ZIP (not a public release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lichii-v17-AMD-RDNA2-PR629-Zelda-PGO-Windows
+          path: upstream/build/rdna2-pgo/bin/
+          if-no-files-found: error
+          retention-days: 14
